@@ -1,0 +1,1199 @@
+diff --git a/admin_pannel/settings.py b/admin_pannel/settings.py
+index faf5525..bdeb941 100644
+--- a/admin_pannel/settings.py
++++ b/admin_pannel/settings.py
+@@ -112,6 +112,7 @@ MIDDLEWARE = [
+     'django.middleware.common.CommonMiddleware',
+     'django.middleware.csrf.CsrfViewMiddleware',
+     'django.contrib.auth.middleware.AuthenticationMiddleware',
++    'users_management.middleware.AdminTokenAuthMiddleware',
+     'django.contrib.messages.middleware.MessageMiddleware',
+     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+     'users_management.middleware.AdminAccessMiddleware',
+diff --git a/users_management/middleware.py b/users_management/middleware.py
+index f7c592d..5351b09 100644
+--- a/users_management/middleware.py
++++ b/users_management/middleware.py
+@@ -27,6 +27,45 @@ def _deny_response(request, message, redirect_to='admin_dashboard:dashboard', st
+     return redirect(redirect_to)
+ 
+ 
++class AdminTokenAuthMiddleware:
++    """Authenticate the mobile admin app via ``Authorization: Bearer adm_...``.
++
++    Only applies to ``/dashboard/api/`` paths. A valid token sets ``request.user``
++    and skips CSRF (no cookies are involved, so CSRF does not apply). Every RBAC
++    check downstream (AdminAccessMiddleware, require_permission, _has_perm)
++    keeps working unchanged because it reads ``request.user``.
++    """
++
++    def __init__(self, get_response):
++        self.get_response = get_response
++
++    def __call__(self, request):
++        auth = request.headers.get('Authorization', '')
++        if request.path.startswith('/dashboard/api/') and auth.startswith('Bearer adm_'):
++            from django.utils import timezone
++            from .models import AdminApiToken
++
++            raw = auth[len('Bearer '):].strip()
++            token = (
++                AdminApiToken.objects.select_related('user')
++                .filter(key_hash=AdminApiToken.hash_key(raw))
++                .first()
++            )
++            now = timezone.now()
++            if not token or token.expires_at <= now or not token.user.is_active:
++                return JsonResponse(
++                    {'error': 'Invalid or expired token', 'ok': False, 'success': False, 'code': 'token_invalid'},
++                    status=401,
++                )
++            if not (token.last_used_at and (now - token.last_used_at).total_seconds() < 60):
++                AdminApiToken.objects.filter(pk=token.pk).update(last_used_at=now)
++            request.user = token.user
++            request._cached_user = token.user
++            request.admin_api_token = token
++            request._dont_enforce_csrf_checks = True
++        return self.get_response(request)
++
++
+ class AdminAccessMiddleware:
+     """Middleware to check admin dashboard access, lock /admin/login/, and enforce RBAC permissions."""
+ 
+@@ -52,6 +91,7 @@ class AdminAccessMiddleware:
+         public_urls = (
+             '/dashboard/login/',
+             '/dashboard/logout/',
++            '/dashboard/api/m/auth/login/',
+         )
+ 
+         if path.startswith('/dashboard/'):
+diff --git a/users_management/migrations/0005_adminapitoken.py b/users_management/migrations/0005_adminapitoken.py
+new file mode 100644
+index 0000000..916c97c
+--- /dev/null
++++ b/users_management/migrations/0005_adminapitoken.py
+@@ -0,0 +1,29 @@
++from django.conf import settings
++from django.db import migrations, models
++import django.db.models.deletion
++
++
++class Migration(migrations.Migration):
++
++    dependencies = [
++        migrations.swappable_dependency(settings.AUTH_USER_MODEL),
++        ('users_management', '0004_alter_userreport_created_at'),
++    ]
++
++    operations = [
++        migrations.CreateModel(
++            name='AdminApiToken',
++            fields=[
++                ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
++                ('key_hash', models.CharField(db_index=True, max_length=64, unique=True)),
++                ('prefix', models.CharField(default='', max_length=12)),
++                ('device_name', models.CharField(blank=True, default='', max_length=200)),
++                ('ip_address', models.GenericIPAddressField(blank=True, null=True)),
++                ('created_at', models.DateTimeField(auto_now_add=True)),
++                ('last_used_at', models.DateTimeField(blank=True, null=True)),
++                ('expires_at', models.DateTimeField(db_index=True)),
++                ('user', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='api_tokens', to=settings.AUTH_USER_MODEL)),
++            ],
++            options={'ordering': ['-created_at']},
++        ),
++    ]
+diff --git a/users_management/mobile_api.py b/users_management/mobile_api.py
+new file mode 100644
+index 0000000..7bde3b3
+--- /dev/null
++++ b/users_management/mobile_api.py
+@@ -0,0 +1,872 @@
++"""JSON API for the mobile admin app (Flutter).
++
++Auth: ``POST /dashboard/api/m/auth/login/`` exchanges username + password
++(+ TOTP / backup code when 2FA is on) for a Bearer token. Every other request
++sends ``Authorization: Bearer adm_...``; ``AdminTokenAuthMiddleware`` turns that
++into ``request.user`` so the existing RBAC (role defaults + per-admin
++overrides), rate limits and audit logs apply unchanged.
++
++Form-based HTML views (report moderation, settings, broadcast...) are reused
++through ``_run_form_view`` instead of duplicating their business logic.
++"""
++import json
++import re
++from datetime import datetime, timedelta
++
++from bson import ObjectId
++from django.conf import settings
++from django.contrib.auth import authenticate
++from django.contrib.auth.models import User
++from django.contrib.messages import get_messages
++from django.http import JsonResponse, QueryDict
++from django.utils import timezone
++from django.views.decorators.csrf import csrf_exempt
++from django.views.decorators.http import require_GET, require_POST
++
++from .models import (
++    ACTIONS, MODULES, MODULE_LABELS, ROLE_DEFAULTS,
++    AdminApiToken, AdminProfile, AuditLog, ErrorLog, SystemSetting,
++)
++from .rate_limit import (
++    check_rate_limit, clear_failures, consume_action_rate_limit,
++    format_retry_wait, get_client_ip, record_failure,
++)
++from .services import (
++    MONGO_COLLECTIONS, clean_value, invalidate_swr, mongo_admin, parallel_run,
++)
++from .totp import verify_and_consume_backup_code, verify_totp_code
++
++PAGE_MAX = 100
++
++
++# ── helpers ─────────────────────────────────────────────────────────
++def _ok(data=None, status=200):
++    payload = {'success': True}
++    payload.update(data or {})
++    return JsonResponse(payload, status=status)
++
++
++def _err(message, status=400, **extra):
++    payload = {'success': False, 'error': message}
++    payload.update(extra)
++    return JsonResponse(payload, status=status)
++
++
++def _body(request):
++    try:
++        return json.loads(request.body or '{}')
++    except (ValueError, UnicodeDecodeError):
++        return {}
++
++
++def _page_args(request, default_limit=20):
++    try:
++        page = max(int(request.GET.get('page', 1) or 1), 1)
++    except ValueError:
++        page = 1
++    try:
++        limit = min(max(int(request.GET.get('limit', default_limit) or default_limit), 1), PAGE_MAX)
++    except ValueError:
++        limit = default_limit
++    return page, limit, (page - 1) * limit
++
++
++def _profile(user):
++    try:
++        return user.admin_profile
++    except Exception:
++        return None
++
++
++def _is_super(user):
++    profile = _profile(user)
++    return bool(user.is_superuser or (profile and profile.role == 'super_admin'))
++
++
++def _has(user, perm):
++    if user.is_superuser:
++        return True
++    profile = _profile(user)
++    return bool(profile and profile.has_perm(perm))
++
++
++def _effective_perms(user):
++    if user.is_superuser:
++        return sorted(f'{m}.{a}' for m in MODULES for a in ACTIONS)
++    profile = _profile(user)
++    if not profile:
++        return []
++    return sorted(f'{m}.{a}' for m in MODULES for a in ACTIONS if profile.has_perm(f'{m}.{a}'))
++
++
++def _require_admin(request):
++    """Return an error response when the caller is not an authenticated admin."""
++    user = request.user
++    if not user.is_authenticated:
++        return _err('Authentication required', 401)
++    if not (user.is_staff or user.is_superuser):
++        return _err('Admin access required', 403)
++    if not user.is_superuser and not _profile(user):
++        return _err('Tài khoản quản trị chưa được cấp hồ sơ phân quyền.', 403)
++    return None
++
++
++def _guard(fn, request, *args, **kwargs):
++    """Turn unexpected exceptions into JSON so the app can show a real message."""
++    from django.http import Http404
++    try:
++        return fn(request, *args, **kwargs)
++    except Http404 as exc:
++        return _err(str(exc) or 'Không tìm thấy', 404)
++    except Exception as exc:  # noqa: BLE001 - surfaced to the admin, also logged
++        try:
++            ErrorLog.objects.create(level='error', message=str(exc)[:2000], request_path=request.path[:500],
++                                    request_method=request.method,
++                                    admin_user=request.user if request.user.is_authenticated else None)
++        except Exception:
++            pass
++        return _err(f'Lỗi server: {exc}', 500)
++
++
++def json_errors(fn):
++    def wrapped(request, *args, **kwargs):
++        return _guard(fn, request, *args, **kwargs)
++    wrapped.__name__ = fn.__name__
++    return wrapped
++
++
++def needs(perm):
++    """Decorator: admin auth + RBAC permission (string or tuple = any of)."""
++    codes = (perm,) if isinstance(perm, str) else tuple(perm)
++
++    def deco(fn):
++        def wrapped(request, *args, **kwargs):
++            denied = _require_admin(request)
++            if denied:
++                return denied
++            if not any(_has(request.user, c) for c in codes):
++                return _err(f'Permission denied ({", ".join(codes)})', 403)
++            return _guard(fn, request, *args, **kwargs)
++        wrapped.__name__ = fn.__name__
++        wrapped.__doc__ = fn.__doc__
++        # No csrf_exempt: Bearer-token requests skip CSRF in AdminTokenAuthMiddleware,
++        # while cookie-session callers stay CSRF-protected.
++        return wrapped
++    return deco
++
++
++def _oid(value):
++    if isinstance(value, ObjectId):
++        return value
++    if isinstance(value, str) and ObjectId.is_valid(value):
++        return ObjectId(value)
++    return None
++
++
++def _regex(text):
++    return {'$regex': re.escape(text), '$options': 'i'}
++
++
++def _run_form_view(request, view, data, *args, **kwargs):
++    """Call an HTML form view as a POST with ``data`` and translate its flash
++    messages + redirect into JSON. Keeps permission checks/rate limits/audit."""
++    qd = QueryDict(mutable=True)
++    for key, value in (data or {}).items():
++        if value is None:
++            continue
++        if isinstance(value, bool):
++            if value:
++                qd[key] = 'on'
++            continue
++        if isinstance(value, (list, tuple)):
++            qd.setlist(key, [str(v) for v in value])
++        else:
++            qd[key] = str(value)
++    request.method = 'POST'
++    request.POST = qd
++    response = view(request, *args, **kwargs)
++    msgs = [{'level': m.level_tag, 'text': str(m)} for m in get_messages(request)]
++    if response.status_code >= 400:
++        try:
++            payload = json.loads(response.content or b'{}')
++        except ValueError:
++            payload = {}
++        return _err(payload.get('error') or (msgs[-1]['text'] if msgs else f'HTTP {response.status_code}'),
++                    response.status_code, messages=msgs)
++    if response.get('Content-Type', '').startswith('application/json'):
++        return response
++    failed = any(m['level'] in ('error', 'danger') for m in msgs)
++    text = msgs[-1]['text'] if msgs else ('Thất bại' if failed else 'Đã thực hiện')
++    if failed:
++        return _err(text, 400, messages=msgs)
++    return _ok({'message': text, 'messages': msgs})
++
++
++def _admin_payload(user):
++    profile = _profile(user)
++    role = 'super_admin' if user.is_superuser and not profile else (profile.role if profile else '')
++    return {
++        'id': user.pk,
++        'username': user.username,
++        'email': user.email,
++        'first_name': user.first_name,
++        'last_name': user.last_name,
++        'is_superuser': user.is_superuser,
++        'role': role,
++        'is_super_admin': _is_super(user),
++        'avatar': (profile.avatar if profile else '') or '',
++        'totp_enabled': bool(profile and profile.totp_enabled),
++        'last_login': user.last_login.isoformat() if user.last_login else None,
++        'date_joined': user.date_joined.isoformat() if user.date_joined else None,
++        'permissions': _effective_perms(user),
++    }
++
++
++# ── auth ────────────────────────────────────────────────────────────
++@csrf_exempt
++@require_POST
++def m_login(request):
++    body = _body(request)
++    username = (body.get('username') or '').strip()
++    password = body.get('password') or ''
++    otp = re.sub(r'\s+', '', str(body.get('otp') or ''))
++    device = (body.get('device') or request.headers.get('User-Agent', ''))[:200]
++
++    allowed, retry_after, reason = check_rate_limit('admin_login', request, username)
++    if not allowed:
++        return _err(f'Quá nhiều lần đăng nhập thất bại ({reason}). Thử lại sau {format_retry_wait(retry_after)}.',
++                    429, retryAfter=retry_after)
++    if not username or not password:
++        return _err('Vui lòng nhập tên đăng nhập và mật khẩu.')
++
++    user = authenticate(request, username=username, password=password)
++    if user is None or not (user.is_staff or user.is_superuser) or not user.is_active:
++        remaining, locked_now, lock_wait = record_failure('admin_login', request, username)
++        if user is not None:
++            return _err('Tài khoản này không có quyền truy cập trang quản trị!', 403)
++        if locked_now:
++            return _err(f'Sai thông tin đăng nhập. Tạm khoá {format_retry_wait(lock_wait)}.', 429, retryAfter=lock_wait)
++        extra = f' (còn {remaining} lần thử)' if remaining <= 2 else ''
++        return _err(f'Tên đăng nhập hoặc mật khẩu không đúng!{extra}', 401)
++
++    profile = AdminProfile.objects.filter(user=user).first()
++    if not user.is_superuser and not profile:
++        return _err('Tài khoản quản trị chưa được cấp hồ sơ phân quyền.', 403)
++
++    method = 'password'
++    if profile and profile.totp_enabled and profile.totp_secret:
++        if not otp:
++            return _ok({'requires_2fa': True})
++        if verify_totp_code(profile.totp_secret, otp):
++            method = 'totp'
++        elif verify_and_consume_backup_code(profile, otp):
++            method = 'totp_backup'
++        else:
++            record_failure('admin_login', request, username)
++            return _err('Mã xác thực 2FA không đúng.', 401, requires_2fa=True)
++    elif _is_super(user) and getattr(settings, 'ENFORCE_SUPERADMIN_2FA', True):
++        return _err('Super Admin phải bật 2FA (TOTP) trên trang web quản trị trước khi đăng nhập app.', 403,
++                    code='2fa_setup_required')
++
++    clear_failures('admin_login', request, username)
++    days = int(getattr(settings, 'ADMIN_API_TOKEN_DAYS', 30))
++    raw, _ = AdminApiToken.issue(user, device, get_client_ip(request), days=days)
++    user.last_login = timezone.now()
++    user.save(update_fields=['last_login'])
++    request.user = user
++    try:
++        AuditLog.log(request, 'login', 'auth', str(user.pk),
++                     {'username': user.username, 'method': method, 'client': 'mobile_app'})
++    except Exception:
++        pass
++    return _ok({'token': raw, 'expires_in_days': days, 'admin': _admin_payload(user)})
++
++
++@require_POST
++def m_logout(request):
++    token = getattr(request, 'admin_api_token', None)
++    if token:
++        AuditLog.log(request, 'logout', 'auth', str(request.user.pk), {'client': 'mobile_app'})
++        token.delete()
++    return _ok()
++
++
++@needs('dashboard.view')
++@require_GET
++def m_me(request):
++    data = _admin_payload(request.user)
++    data['modules'] = [{'key': m, 'label': MODULE_LABELS.get(m, m)} for m in MODULES]
++    return _ok({'admin': data})
++
++
++@needs('dashboard.view')
++def m_tokens(request):
++    """List / revoke the caller's own app sessions."""
++    if request.method == 'POST':
++        body = _body(request)
++        tid = body.get('id')
++        qs = AdminApiToken.objects.filter(user=request.user)
++        if body.get('all_others'):
++            current = getattr(request, 'admin_api_token', None)
++            n, _ = qs.exclude(pk=getattr(current, 'pk', None)).delete()
++        else:
++            n, _ = qs.filter(pk=tid).delete()
++        return _ok({'deleted': n})
++    current = getattr(request, 'admin_api_token', None)
++    rows = [{
++        'id': t.pk, 'device': t.device_name, 'ip': t.ip_address, 'prefix': t.prefix,
++        'created_at': t.created_at.isoformat(),
++        'last_used_at': t.last_used_at.isoformat() if t.last_used_at else None,
++        'expires_at': t.expires_at.isoformat(),
++        'current': bool(current and current.pk == t.pk),
++    } for t in AdminApiToken.objects.filter(user=request.user)]
++    return _ok({'rows': rows})
++
++
++# ── users (MongoDB) ─────────────────────────────────────────────────
++_USER_HIDE = {
++    'password': 0, 'emailVerificationToken': 0, 'friends': 0,
++    'friendRequests': 0, 'sentFriendRequests': 0, 'watchlist': 0,
++}
++
++
++@needs('users.view')
++@require_GET
++def m_users(request):
++    page, limit, skip = _page_args(request)
++    search = request.GET.get('search', '').strip()
++    query = {}
++    if search:
++        ors = [{'name': _regex(search)}, {'email': _regex(search)}, {'username': _regex(search)}]
++        if _oid(search):
++            ors.append({'_id': _oid(search)})
++        query['$or'] = ors
++    verified = request.GET.get('verified', '')
++    if verified in ('true', 'false'):
++        query['isEmailVerified'] = True if verified == 'true' else {'$ne': True}
++    banned = request.GET.get('banned', '')
++    if banned in ('true', 'false'):
++        query['isBanned'] = True if banned == 'true' else {'$ne': True}
++    auth_type = request.GET.get('auth_type', '')
++    if auth_type == 'google':
++        query['authType'] = 'google'
++    elif auth_type == 'email':
++        query['authType'] = {'$ne': 'google'}
++    sort = {'name': ('name', 1), 'email': ('email', 1), 'oldest': ('createdAt', 1)}.get(
++        request.GET.get('sort', ''), ('createdAt', -1))
++
++    db = mongo_admin.db()
++    pipeline = ([{'$match': query}] if query else []) + [
++        {'$sort': {sort[0]: sort[1]}},
++        {'$skip': skip},
++        {'$limit': limit},
++        {'$addFields': {'watchlist_count': {'$size': {'$ifNull': ['$watchlist', []]}},
++                        'friends_count': {'$size': {'$ifNull': ['$friends', []]}}}},
++        {'$project': _USER_HIDE},
++    ]
++
++    def stats():
++        res = list(db.users.aggregate([{'$group': {
++            '_id': None,
++            'total': {'$sum': 1},
++            'verified': {'$sum': {'$cond': [{'$eq': ['$isEmailVerified', True]}, 1, 0]}},
++            'banned': {'$sum': {'$cond': [{'$eq': ['$isBanned', True]}, 1, 0]}},
++            'google': {'$sum': {'$cond': [{'$eq': ['$authType', 'google']}, 1, 0]}},
++        }}]))
++        doc = res[0] if res else {}
++        doc.pop('_id', None)
++        return doc
++
++    res = parallel_run({
++        'rows': lambda: list(db.users.aggregate(pipeline)),
++        'total': lambda: db.users.count_documents(query),
++        'stats': stats,
++    }, max_workers=3)
++    total = res['total']
++    return _ok({
++        'rows': clean_value(res['rows']), 'total': total, 'page': page, 'limit': limit,
++        'has_more': skip + len(res['rows']) < total, 'stats': clean_value(res['stats']),
++    })
++
++
++@needs('users.view')
++def m_user_detail(request, user_id):
++    oid = _oid(user_id)
++    if not oid:
++        return _err('ID không hợp lệ', 404)
++    db = mongo_admin.db()
++    user = db.users.find_one({'_id': oid}, {'password': 0, 'emailVerificationToken': 0})
++    if not user:
++        return _err('Không tìm thấy người dùng', 404)
++
++    ban_exp = user.get('banExpiresAt')
++    if user.get('isBanned') and isinstance(ban_exp, datetime) and ban_exp <= datetime.utcnow():
++        db.users.update_one({'_id': oid}, {'$set': {
++            'isBanned': False, 'banReason': '', 'banExpiresAt': None, 'bannedAt': None, 'bannedBy': ''}})
++        user.update({'isBanned': False, 'banReason': '', 'banExpiresAt': None})
++
++    res = parallel_run({
++        'sessions': lambda: list(db.sessions.find({'userId': oid}, {'refreshToken': 0}).sort('lastActive', -1).limit(20)),
++        'comments': lambda: list(db.comments.find({'userId': oid}).sort('createdAt', -1).limit(20)),
++        'comments_total': lambda: db.comments.count_documents({'userId': oid}),
++        'progress': lambda: list(db.watchprogresses.find({'userId': oid}).sort('lastWatched', -1).limit(20)),
++        'progress_total': lambda: db.watchprogresses.count_documents({'userId': oid}),
++        'searches': lambda: list(db.searchhistories.find({'$or': [{'user_id': oid}, {'userId': oid}]}).limit(1)),
++        'reports': lambda: db.userreports.count_documents({'reportedUserId': {'$in': [oid, str(oid)]}}),
++        'friends': lambda: list(db.users.find({'_id': {'$in': user.get('friends', [])[:50]}},
++                                              {'name': 1, 'email': 1, 'avatar': 1})),
++    }, max_workers=8)
++    for key in ('friendRequests', 'sentFriendRequests', 'friends'):
++        user[f'{key}_count'] = len(user.pop(key, []) or [])
++    return _ok({
++        'user': clean_value(user),
++        'sessions': clean_value(res['sessions']),
++        'comments': clean_value(res['comments']),
++        'comments_total': res['comments_total'],
++        'progress': clean_value(res['progress']),
++        'progress_total': res['progress_total'],
++        'search_history': clean_value(res['searches'][0]) if res['searches'] else None,
++        'reports_against': res['reports'],
++        'friends': clean_value(res['friends']),
++    })
++
++
++@needs('users.edit')
++@require_POST
++def m_user_update(request, user_id):
++    oid = _oid(user_id)
++    if not oid:
++        return _err('ID không hợp lệ', 404)
++    body = _body(request)
++    db = mongo_admin.db()
++    update = {'updatedAt': datetime.utcnow()}
++    for field in ('name', 'avatar'):
++        if field in body and body[field] is not None:
++            update[field] = str(body[field]).strip()
++    if body.get('username'):
++        username = str(body['username']).strip().lower()
++        if db.users.find_one({'username': username, '_id': {'$ne': oid}}, {'_id': 1}):
++            return _err('Username đã được dùng')
++        update['username'] = username
++    if body.get('email'):
++        email = str(body['email']).strip().lower()
++        if db.users.find_one({'email': email, '_id': {'$ne': oid}}, {'_id': 1}):
++            return _err('Email đã được dùng')
++        update['email'] = email
++    if 'isEmailVerified' in body:
++        update['isEmailVerified'] = bool(body['isEmailVerified'])
++    result = db.users.update_one({'_id': oid}, {'$set': update})
++    if not result.matched_count:
++        return _err('Không tìm thấy người dùng', 404)
++    invalidate_swr('user_list_stats_v2', 'mongo_overview_cache')
++    AuditLog.log(request, 'edit_user', 'user', user_id, clean_value(update))
++    return _ok({'message': 'Đã cập nhật người dùng'})
++
++
++@needs('users.delete')
++@require_POST
++def m_user_delete(request, user_id):
++    from .views.users import user_delete
++    return _run_form_view(request, user_delete, {}, user_id=user_id)
++
++
++@needs('sessions.delete')
++@require_POST
++def m_user_revoke_sessions(request, user_id):
++    oid = _oid(user_id)
++    if not oid:
++        return _err('ID không hợp lệ', 404)
++    body = _body(request)
++    db = mongo_admin.db()
++    if body.get('session_id') and _oid(body['session_id']):
++        n = db.sessions.delete_one({'_id': _oid(body['session_id']), 'userId': oid}).deleted_count
++    else:
++        n = db.sessions.delete_many({'userId': oid}).deleted_count
++    invalidate_swr('sessions_global_stats_v1')
++    AuditLog.log(request, 'revoke_user_sessions', 'user', user_id, {'count': n})
++    return _ok({'deleted': n, 'message': f'Đã thu hồi {n} phiên'})
++
++
++# ── comments ────────────────────────────────────────────────────────
++@needs('comments.view')
++@require_GET
++def m_comments(request):
++    page, limit, skip = _page_args(request)
++    query = {}
++    search = request.GET.get('search', '').strip()
++    if search:
++        query['content'] = _regex(search)
++    status = request.GET.get('status', '')
++    if status == 'hidden':
++        query['isDeleted'] = True
++    elif status == 'visible':
++        query['isDeleted'] = {'$ne': True}
++    if request.GET.get('user_id') and _oid(request.GET['user_id']):
++        query['userId'] = _oid(request.GET['user_id'])
++    if request.GET.get('movie_id'):
++        mid = request.GET['movie_id']
++        query['movieId'] = {'$in': [mid, int(mid)] if mid.isdigit() else [mid]}
++    if request.GET.get('replies') == 'false':
++        query['parentId'] = None
++    db = mongo_admin.db()
++    pipeline = [
++        {'$match': query},
++        {'$sort': {'createdAt': -1}},
++        {'$skip': skip},
++        {'$limit': limit},
++        {'$lookup': {'from': 'users', 'localField': 'userId', 'foreignField': '_id', 'as': 'user'}},
++        {'$unwind': {'path': '$user', 'preserveNullAndEmptyArrays': True}},
++        {'$project': {'user.password': 0, 'user.watchlist': 0, 'user.friends': 0,
++                      'user.friendRequests': 0, 'user.sentFriendRequests': 0, 'user.emailVerificationToken': 0}},
++    ]
++    res = parallel_run({
++        'rows': lambda: list(db.comments.aggregate(pipeline)),
++        'total': lambda: db.comments.count_documents(query),
++    }, max_workers=2)
++    return _ok({'rows': clean_value(res['rows']), 'total': res['total'], 'page': page,
++                'has_more': skip + len(res['rows']) < res['total']})
++
++
++# ── generic collection browser ──────────────────────────────────────
++_SEARCH_FIELDS = {
++    'users': ['name', 'email', 'username'],
++    'sessions': ['deviceName', 'deviceType', 'browser', 'os', 'ipAddress', 'ip', 'userAgent'],
++    'comments': ['content'],
++    'userreports': ['reason', 'details', 'targetDetail', 'reporterName', 'reportedUserName'],
++    'watchprogresses': ['title', 'contentId'],
++    'streamhistories': ['title', 'tmdbId', 'server', 'url'],
++    'searchhistories': ['history.query', 'terms'],
++    'notifications': ['title', 'message', 'content', 'type'],
++    'passwordresettokens': ['email'],
++    'blacklistedtokens': ['reason'],
++    'gameprofiles': ['username', 'name', 'displayName'],
++    'gamehistories': ['mode', 'winner'],
++    'dailychallenges': ['title', 'date'],
++    'dailysubmissions': ['username', 'date'],
++    'systemsettings': ['key'],
++}
++_USER_REF_FIELDS = ['userId', 'user_id', 'user', 'recipient', 'reporterId']
++_COLLECTION_MODULE = {
++    'users': 'users', 'sessions': 'sessions', 'comments': 'comments', 'userreports': 'reports',
++    'watchprogresses': 'watch_progress', 'streamhistories': 'stream_history',
++    'searchhistories': 'search_history', 'notifications': 'notifications',
++    'passwordresettokens': 'tokens', 'blacklistedtokens': 'tokens', 'gameprofiles': 'games',
++    'gamehistories': 'games', 'dailychallenges': 'daily_challenge', 'dailysubmissions': 'daily_challenge',
++    'systemsettings': 'settings',
++}
++
++
++@json_errors
++def m_collections(request):
++    denied = _require_admin(request)
++    if denied:
++        return denied
++    db = mongo_admin.db()
++    visible = [c for c in MONGO_COLLECTIONS if _has(request.user, f"{_COLLECTION_MODULE.get(c, 'dashboard')}.view")]
++    counts = parallel_run({c: (lambda n=c: db[n].estimated_document_count()) for c in visible}, max_workers=8)
++    rows = [{
++        'key': c, 'label': MONGO_COLLECTIONS[c]['label'], 'count': counts.get(c, 0),
++        'module': _COLLECTION_MODULE.get(c, 'dashboard'),
++        'can_delete': _has(request.user, f"{_COLLECTION_MODULE.get(c, 'dashboard')}.delete"),
++    } for c in visible]
++    return _ok({'rows': rows})
++
++
++@json_errors
++def m_collection(request, collection):
++    denied = _require_admin(request)
++    if denied:
++        return denied
++    meta = MONGO_COLLECTIONS.get(collection)
++    if not meta:
++        return _err('Collection không hỗ trợ', 404)
++    module = _COLLECTION_MODULE.get(collection, 'dashboard')
++    if not _has(request.user, f'{module}.view'):
++        return _err(f'Permission denied ({module}.view)', 403)
++    page, limit, skip = _page_args(request)
++    query = {}
++    q = request.GET.get('q', '').strip()
++    if q:
++        ors = [{f: _regex(q)} for f in _SEARCH_FIELDS.get(collection, [])]
++        if _oid(q):
++            ors.append({'_id': _oid(q)})
++            ors.extend({f: _oid(q)} for f in _USER_REF_FIELDS)
++        query['$or'] = ors or [{'_id': None}]
++    uid = _oid(request.GET.get('user_id', ''))
++    if uid:
++        query.setdefault('$and', []).append({'$or': [{f: uid} for f in _USER_REF_FIELDS]})
++    db = mongo_admin.db()
++    coll = db[collection]
++    res = parallel_run({
++        'rows': lambda: list(coll.find(query, meta.get('projection')).sort(meta.get('sort', [('_id', -1)]))
++                             .skip(skip).limit(limit)),
++        'total': lambda: coll.count_documents(query) if query else coll.estimated_document_count(),
++    }, max_workers=2)
++    return _ok({'rows': clean_value(res['rows']), 'total': res['total'], 'page': page,
++                'has_more': skip + len(res['rows']) < res['total'], 'label': meta['label'],
++                'can_delete': _has(request.user, f'{module}.delete')})
++
++
++@json_errors
++@require_POST
++def m_collection_delete(request, collection):
++    """Bulk/single delete for collections without a dedicated cascade (comments/users use their own)."""
++    denied = _require_admin(request)
++    if denied:
++        return denied
++    if collection not in MONGO_COLLECTIONS or collection in ('users', 'systemsettings'):
++        return _err('Không hỗ trợ xoá collection này ở đây', 400)
++    module = _COLLECTION_MODULE.get(collection, 'dashboard')
++    if not _has(request.user, f'{module}.delete'):
++        return _err(f'Permission denied ({module}.delete)', 403)
++    allowed, retry_after, _ = consume_action_rate_limit('admin_sensitive', request)
++    if not allowed:
++        return _err(f'Thao tác quá nhanh. Thử lại sau {format_retry_wait(retry_after)}.', 429)
++    ids = [_oid(i) for i in (_body(request).get('ids') or [])]
++    ids = [i for i in ids if i]
++    if not ids:
++        return _err('Chưa chọn bản ghi')
++    if collection == 'comments':
++        n = sum(mongo_admin.delete_document('comments', str(i)) for i in ids)
++    else:
++        n = mongo_admin.db()[collection].delete_many({'_id': {'$in': ids}}).deleted_count
++    invalidate_swr('mongo_overview_cache', 'admin_sidebar_counts')
++    AuditLog.log(request, 'bulk_delete', collection, '', {'ids': [str(i) for i in ids], 'count': n})
++    return _ok({'deleted': n, 'message': f'Đã xoá {n} bản ghi'})
++
++
++# ── reports (moderation queue) ──────────────────────────────────────
++@needs('reports.view')
++@require_GET
++def m_reports(request):
++    page, limit, skip = _page_args(request)
++    query = {}
++    status = request.GET.get('status', '')
++    if status in ('pending', 'reviewing', 'resolved', 'dismissed'):
++        query['status'] = status
++    search = request.GET.get('search', '').strip()
++    if search:
++        rx = _regex(search)
++        query['$or'] = [{'targetDetail': rx}, {'reason': rx}, {'details': rx},
++                        {'reporterName': rx}, {'reportedUserName': rx}]
++    db = mongo_admin.db()
++    res = parallel_run({
++        'rows': lambda: list(db.userreports.find(query).sort('createdAt', -1).skip(skip).limit(limit)),
++        'total': lambda: db.userreports.count_documents(query),
++        'counts': lambda: {r['_id']: r['n'] for r in db.userreports.aggregate(
++            [{'$group': {'_id': '$status', 'n': {'$sum': 1}}}])},
++    }, max_workers=3)
++    rows = res['rows']
++    comment_ids = [_oid(r.get('targetId')) for r in rows if r.get('targetType', 'comment') == 'comment']
++    comments = {str(c['_id']): c for c in db.comments.find(
++        {'_id': {'$in': [c for c in comment_ids if c]}}, {'content': 1, 'isDeleted': 1, 'movieId': 1, 'type': 1})}
++    for r in rows:
++        c = comments.get(str(r.get('targetId')))
++        if c:
++            r['comment'] = c
++    return _ok({'rows': clean_value(rows), 'total': res['total'], 'page': page,
++                'has_more': skip + len(rows) < res['total'], 'counts': res['counts']})
++
++
++@needs('reports.edit')
++@require_POST
++def m_report_action(request, report_id):
++    from .views.reports import report_action
++    body = _body(request)
++    data = {
++        'action': body.get('action', ''),
++        'note': body.get('note', ''),
++        'apply_siblings': '1' if body.get('apply_siblings', True) else '0',
++        'ban_reason': body.get('ban_reason', ''),
++        'hide_comment': '1' if body.get('hide_comment', True) else '0',
++        'ban_duration_hours': body.get('ban_duration_hours') or 0,
++    }
++    return _run_form_view(request, report_action, data, report_id=report_id)
++
++
++# ── notifications broadcast ─────────────────────────────────────────
++@needs('notifications.edit')
++@require_POST
++def m_broadcast(request):
++    from .views_legacy import notifications_list
++    body = _body(request)
++    data = {
++        'action': 'broadcast',
++        'type': body.get('type') or 'version_updated',
++        'title': body.get('title') or 'Thông báo hệ thống',
++        'message': body.get('message') or '',
++        'target_mode': body.get('target_mode') or 'all',
++        'target_users': body.get('target_users') or '',
++        'send_expo_push': bool(body.get('send_expo_push')),
++    }
++    if not data['message'].strip():
++        return _err('Nội dung thông báo không được trống')
++    return _run_form_view(request, notifications_list, data)
++
++
++# ── platform settings ───────────────────────────────────────────────
++@needs('settings.view')
++def m_settings(request):
++    from .views.settings_view import DEFAULT_SETTINGS, system_settings
++    if request.method == 'POST':
++        if not _has(request.user, 'settings.edit'):
++            return _err('Permission denied (settings.edit)', 403)
++        body = _body(request)
++        data = {}
++        for key, default, _desc in DEFAULT_SETTINGS:
++            val = body.get(key, default)
++            data[key] = bool(val) if isinstance(default, bool) else val
++        return _run_form_view(request, system_settings, data)
++    mongo_settings = {}
++    try:
++        doc = mongo_admin.db().systemsettings.find_one({'key': 'platform_settings'})
++        if doc and isinstance(doc.get('settings'), dict):
++            mongo_settings = doc['settings']
++    except Exception:
++        pass
++    rows = [{
++        'key': key, 'value': mongo_settings.get(key, SystemSetting.get(key, default)), 'default': default,
++        'description': desc,
++        'type': 'bool' if isinstance(default, bool) else 'int' if isinstance(default, int) else 'str',
++    } for key, default, desc in DEFAULT_SETTINGS]
++    return _ok({'rows': rows, 'can_edit': _has(request.user, 'settings.edit')})
++
++
++# ── stream servers ──────────────────────────────────────────────────
++@needs('servers.view')
++@require_GET
++def m_servers(request):
++    from .views.servers import get_vidsrc_settings, probe_streaming_clusters
++    return _ok({
++        'vidsrc': clean_value(get_vidsrc_settings()),
++        'clusters': clean_value(probe_streaming_clusters(force=request.GET.get('refresh') == '1')),
++        'can_edit': _has(request.user, 'servers.edit'),
++    })
++
++
++# ── admin accounts (Django) ─────────────────────────────────────────
++@needs('admins.view')
++def m_admins(request):
++    if request.method == 'POST':
++        return _admin_mutation(request)
++    rows = []
++    for u in User.objects.filter(is_staff=True).select_related('admin_profile').order_by('username'):
++        p = _profile(u)
++        rows.append({
++            'id': u.pk, 'username': u.username, 'email': u.email, 'is_active': u.is_active,
++            'is_superuser': u.is_superuser, 'role': p.role if p else ('super_admin' if u.is_superuser else ''),
++            'totp_enabled': bool(p and p.totp_enabled),
++            'last_login': u.last_login.isoformat() if u.last_login else None,
++            'date_joined': u.date_joined.isoformat(),
++            'app_sessions': AdminApiToken.objects.filter(user=u, expires_at__gt=timezone.now()).count(),
++        })
++    return _ok({'rows': rows, 'roles': list(ROLE_DEFAULTS.keys()),
++                'can_edit': _has(request.user, 'admins.edit'), 'is_super_admin': _is_super(request.user)})
++
++
++def _admin_mutation(request):
++    """Create admin / change role / toggle active / revoke app sessions (super admin only)."""
++    if not _is_super(request.user):
++        return _err('Chỉ Super Admin mới thực hiện được thao tác này.', 403)
++    allowed, retry_after, _ = consume_action_rate_limit('admin_sensitive', request)
++    if not allowed:
++        return _err(f'Thao tác quá nhanh. Thử lại sau {format_retry_wait(retry_after)}.', 429)
++    body = _body(request)
++    action = body.get('action')
++    role = body.get('role')
++    if role and role not in ROLE_DEFAULTS:
++        return _err('Role không hợp lệ')
++
++    if action == 'create':
++        username = (body.get('username') or '').strip()
++        password = body.get('password') or ''
++        if not username or len(password) < 8:
++            return _err('Cần username và mật khẩu tối thiểu 8 ký tự')
++        if User.objects.filter(username=username).exists():
++            return _err('Username đã tồn tại')
++        from django.contrib.auth.password_validation import validate_password
++        from django.core.exceptions import ValidationError
++        try:
++            validate_password(password)
++        except ValidationError as exc:
++            return _err(' '.join(exc.messages))
++        u = User.objects.create_user(username=username, email=(body.get('email') or '').strip(),
++                                     password=password, is_staff=True)
++        AdminProfile.objects.create(user=u, role=role or 'viewer')
++        AuditLog.log(request, 'create_admin', 'admin', u.pk, {'username': username, 'role': role or 'viewer'})
++        return _ok({'message': f'Đã tạo admin {username}'})
++
++    try:
++        target = User.objects.get(pk=int(body.get('id')), is_staff=True)
++    except (User.DoesNotExist, TypeError, ValueError):
++        return _err('Không tìm thấy admin', 404)
++    if target.pk == request.user.pk and action in ('set_role', 'toggle_active'):
++        return _err('Không thể tự đổi quyền/khoá chính mình')
++    if target.is_superuser and not request.user.is_superuser:
++        return _err('Không thể thao tác trên superuser', 403)
++
++    if action == 'set_role':
++        profile, _ = AdminProfile.objects.get_or_create(user=target)
++        profile.role = role or profile.role
++        profile.save(update_fields=['role', 'updated_at'])
++        AuditLog.log(request, 'edit_admin', 'admin', target.pk, {'role': profile.role})
++        return _ok({'message': f'Đã đổi role {target.username} → {profile.role}'})
++    if action == 'toggle_active':
++        target.is_active = not target.is_active
++        target.save(update_fields=['is_active'])
++        if not target.is_active:
++            AdminApiToken.objects.filter(user=target).delete()
++        AuditLog.log(request, 'toggle_admin_active', 'admin', target.pk, {'is_active': target.is_active})
++        return _ok({'message': f'{target.username}: {"đã mở khoá" if target.is_active else "đã khoá"}'})
++    if action == 'revoke_tokens':
++        n, _ = AdminApiToken.objects.filter(user=target).delete()
++        AuditLog.log(request, 'revoke_admin_tokens', 'admin', target.pk, {'count': n})
++        return _ok({'message': f'Đã đăng xuất {n} phiên app của {target.username}'})
++    return _err('Hành động không hợp lệ')
++
++
++# ── audit + error logs ──────────────────────────────────────────────
++@needs('audit_logs.view')
++@require_GET
++def m_audit_logs(request):
++    page, limit, skip = _page_args(request, 30)
++    qs = AuditLog.objects.all()
++    q = request.GET.get('q', '').strip()
++    if q:
++        from django.db.models import Q
++        qs = qs.filter(Q(action__icontains=q) | Q(admin_username__icontains=q) | Q(target_id__icontains=q)
++                       | Q(target_type__icontains=q))
++    if request.GET.get('admin'):
++        qs = qs.filter(admin_username=request.GET['admin'])
++    total = qs.count()
++    rows = [{
++        'id': a.pk, 'admin': a.admin_username, 'action': a.action, 'target_type': a.target_type,
++        'target_id': a.target_id, 'details': a.details, 'ip': a.ip_address,
++        'user_agent': a.user_agent, 'timestamp': a.timestamp.isoformat(),
++    } for a in qs.order_by('-timestamp')[skip:skip + limit]]
++    return _ok({'rows': rows, 'total': total, 'page': page, 'has_more': skip + len(rows) < total})
++
++
++@needs('error_logs.view')
++def m_error_logs(request):
++    if request.method == 'POST':
++        if not _has(request.user, 'error_logs.delete'):
++            return _err('Permission denied (error_logs.delete)', 403)
++        days = int(_body(request).get('older_than_days') or 0)
++        qs = ErrorLog.objects.all()
++        if days > 0:
++            qs = qs.filter(timestamp__lt=timezone.now() - timedelta(days=days))
++        n, _ = qs.delete()
++        AuditLog.log(request, 'clear_error_logs', 'system', '', {'count': n, 'older_than_days': days})
++        return _ok({'deleted': n, 'message': f'Đã xoá {n} log'})
++    page, limit, skip = _page_args(request, 30)
++    qs = ErrorLog.objects.all()
++    if request.GET.get('level'):
++        qs = qs.filter(level=request.GET['level'])
++    total = qs.count()
++    rows = [{
++        'id': e.pk, 'level': e.level, 'message': e.message, 'traceback': e.traceback_text,
++        'path': e.request_path, 'method': e.request_method, 'ip': e.ip_address,
++        'timestamp': e.timestamp.isoformat(),
++    } for e in qs.order_by('-timestamp')[skip:skip + limit]]
++    return _ok({'rows': rows, 'total': total, 'page': page, 'has_more': skip + len(rows) < total})
+diff --git a/users_management/models.py b/users_management/models.py
+index 30be0d7..b753f9d 100644
+--- a/users_management/models.py
++++ b/users_management/models.py
+@@ -485,3 +485,42 @@ class WebhookLog(models.Model):
+ 
+     def __str__(self):
+         return f"{self.event} → {self.endpoint.name} ({self.response_status})"
++
++
++# ── Mobile admin app API tokens ─────────────────────────────────────
++class AdminApiToken(models.Model):
++    """Bearer token for the mobile admin app. Only the SHA-256 hash is stored."""
++    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='api_tokens')
++    key_hash = models.CharField(max_length=64, unique=True, db_index=True)
++    prefix = models.CharField(max_length=12, default='')
++    device_name = models.CharField(max_length=200, blank=True, default='')
++    ip_address = models.GenericIPAddressField(null=True, blank=True)
++    created_at = models.DateTimeField(auto_now_add=True)
++    last_used_at = models.DateTimeField(null=True, blank=True)
++    expires_at = models.DateTimeField(db_index=True)
++
++    class Meta:
++        ordering = ['-created_at']
++
++    def __str__(self):
++        return f"{self.user.username} · {self.prefix}… ({self.device_name})"
++
++    @staticmethod
++    def hash_key(raw_key):
++        import hashlib
++        return hashlib.sha256(raw_key.encode('utf-8')).hexdigest()
++
++    @classmethod
++    def issue(cls, user, device_name='', ip=None, days=30):
++        import secrets
++        from datetime import timedelta
++        raw = 'adm_' + secrets.token_urlsafe(40)
++        token = cls.objects.create(
++            user=user,
++            key_hash=cls.hash_key(raw),
++            prefix=raw[:12],
++            device_name=(device_name or '')[:200],
++            ip_address=ip or None,
++            expires_at=timezone.now() + timedelta(days=days),
++        )
++        return raw, token
+diff --git a/users_management/test_mobile_api.py b/users_management/test_mobile_api.py
+new file mode 100644
+index 0000000..ed3d6d2
+--- /dev/null
++++ b/users_management/test_mobile_api.py
+@@ -0,0 +1,128 @@
++"""Tests for the mobile admin app token API."""
++import json
++from unittest.mock import MagicMock, patch
++
++from django.contrib.auth.models import User
++from django.test import Client, TestCase, override_settings
++
++from users_management.models import AdminApiToken, AdminProfile, AuditLog
++from users_management.rate_limit import reset_memory_rate_limits
++from users_management.totp import generate_totp_secret, get_totp_code
++
++LOGIN = '/dashboard/api/m/auth/login/'
++
++
++@override_settings(ENFORCE_SUPERADMIN_2FA=True)
++class MobileApiTests(TestCase):
++    def setUp(self):
++        reset_memory_rate_limits()
++        self.mod = User.objects.create_user('mod', password='Str0ng!Pass', is_staff=True)
++        AdminProfile.objects.create(user=self.mod, role='moderator')
++        self.viewer = User.objects.create_user('view', password='Str0ng!Pass', is_staff=True)
++        AdminProfile.objects.create(user=self.viewer, role='viewer')
++        self.boss = User.objects.create_user('boss', password='Str0ng!Pass', is_staff=True)
++        self.secret = generate_totp_secret()
++        AdminProfile.objects.create(user=self.boss, role='super_admin', totp_enabled=True, totp_secret=self.secret)
++        self.c = Client(enforce_csrf_checks=True)
++
++    def login(self, username, **extra):
++        return self.c.post(LOGIN, json.dumps({'username': username, 'password': 'Str0ng!Pass', **extra}),
++                           content_type='application/json')
++
++    def auth(self, token):
++        return {'HTTP_AUTHORIZATION': f'Bearer {token}'}
++
++    def test_login_issues_hashed_token_and_me_works(self):
++        r = self.login('mod', device='Pixel')
++        self.assertEqual(r.status_code, 200, r.content)
++        token = r.json()['token']
++        self.assertTrue(token.startswith('adm_'))
++        self.assertFalse(AdminApiToken.objects.filter(key_hash=token).exists())
++        self.assertTrue(AdminApiToken.objects.filter(key_hash=AdminApiToken.hash_key(token)).exists())
++        me = self.c.get('/dashboard/api/m/me/', **self.auth(token)).json()
++        self.assertEqual(me['admin']['role'], 'moderator')
++        self.assertIn('comments.delete', me['admin']['permissions'])
++        self.assertNotIn('settings.view', me['admin']['permissions'])
++        self.assertTrue(AuditLog.objects.filter(action='login', admin_username='mod').exists())
++
++    def test_wrong_password_and_bad_token(self):
++        self.assertEqual(self.c.post(LOGIN, json.dumps({'username': 'mod', 'password': 'x'}),
++                                     content_type='application/json').status_code, 401)
++        r = self.c.get('/dashboard/api/m/me/', **self.auth('adm_nope'))
++        self.assertEqual(r.status_code, 401)
++        self.assertEqual(r.json()['code'], 'token_invalid')
++        self.assertEqual(self.c.get('/dashboard/api/m/me/').status_code, 401)
++
++    def test_non_staff_rejected(self):
++        User.objects.create_user('joe', password='Str0ng!Pass')
++        self.assertEqual(self.login('joe').status_code, 403)
++
++    def test_2fa_flow(self):
++        r = self.login('boss')
++        self.assertTrue(r.json().get('requires_2fa'))
++        self.assertNotIn('token', r.json())
++        self.assertEqual(self.login('boss', otp='000000').status_code, 401)
++        r = self.login('boss', otp=get_totp_code(self.secret))
++        self.assertEqual(r.status_code, 200, r.content)
++        self.assertTrue(r.json()['admin']['is_super_admin'])
++
++    def test_super_admin_without_2fa_blocked(self):
++        u = User.objects.create_superuser('root', password='Str0ng!Pass')
++        self.assertEqual(self.login('root').json().get('code'), '2fa_setup_required')
++
++    def test_rbac_enforced(self):
++        token = self.login('mod').json()['token']
++        self.assertEqual(self.c.get('/dashboard/api/m/settings/', **self.auth(token)).status_code, 403)
++        self.assertEqual(self.c.get('/dashboard/api/m/admins/', **self.auth(token)).status_code, 403)
++        vtoken = self.login('view').json()['token']
++        r = self.c.post('/dashboard/api/m/users/507f1f77bcf86cd799439011/update/', '{}',
++                        content_type='application/json', **self.auth(vtoken))
++        self.assertEqual(r.status_code, 403)
++
++    def test_session_cookie_post_still_needs_csrf(self):
++        self.c.force_login(self.mod)
++        r = self.c.post('/dashboard/api/m/auth/logout/')
++        self.assertEqual(r.status_code, 403)  # CSRF failure, not exempt
++
++    def test_logout_revokes_token(self):
++        token = self.login('mod').json()['token']
++        self.assertEqual(self.c.post('/dashboard/api/m/auth/logout/', **self.auth(token)).status_code, 200)
++        self.assertEqual(self.c.get('/dashboard/api/m/me/', **self.auth(token)).status_code, 401)
++
++    def test_existing_json_endpoint_accepts_token_without_csrf(self):
++        token = self.login('mod').json()['token']
++        with patch('users_management.views_legacy.mongo_admin') as mm:
++            mm.set_comment_deleted.return_value = 1
++            r = self.c.post('/dashboard/api/mongo/comments/507f1f77bcf86cd799439011/hide/', **self.auth(token))
++        self.assertEqual(r.status_code, 200, r.content)
++        self.assertTrue(r.json()['success'])
++
++    def test_users_list_uses_mongo(self):
++        token = self.login('mod').json()['token']
++        fake_db = MagicMock()
++        fake_db.users.aggregate.side_effect = [
++            [{'_id': 'a1', 'name': 'An'}],
++            [{'_id': None, 'total': 1, 'verified': 1, 'banned': 0, 'google': 0}],
++        ]
++        fake_db.users.count_documents.return_value = 1
++        with patch('users_management.mobile_api.mongo_admin') as mm:
++            mm.db.return_value = fake_db
++            r = self.c.get('/dashboard/api/m/users/?search=an', **self.auth(token))
++        self.assertEqual(r.status_code, 200, r.content)
++        self.assertEqual(r.json()['total'], 1)
++
++    def test_super_admin_creates_admin(self):
++        token = self.login('boss', otp=get_totp_code(self.secret)).json()['token']
++        r = self.c.post('/dashboard/api/m/admins/', json.dumps(
++            {'action': 'create', 'username': 'newbie', 'password': 'An0ther!Strong', 'role': 'viewer'}),
++            content_type='application/json', **self.auth(token))
++        self.assertEqual(r.status_code, 200, r.content)
++        self.assertEqual(User.objects.get(username='newbie').admin_profile.role, 'viewer')
++
++    def test_backend_failure_returns_json(self):
++        token = self.login('mod').json()['token']
++        with patch('users_management.mobile_api.mongo_admin') as mm:
++            mm.db.side_effect = RuntimeError('MONGODB_URI is not configured')
++            r = self.c.get('/dashboard/api/m/users/', **self.auth(token))
++        self.assertEqual(r.status_code, 500)
++        self.assertIn('MONGODB_URI', r.json()['error'])
+diff --git a/users_management/urls.py b/users_management/urls.py
+index bcbd2a8..b7d7844 100644
+--- a/users_management/urls.py
++++ b/users_management/urls.py
+@@ -136,3 +136,30 @@ urlpatterns = [
+     path('api/export/<str:collection_name>/', views.export_collection, name='api_export'),
+     path('api/backup/download/', views.backup_download, name='backup_download'),
+ ]
++
++# ── Mobile admin app (Bearer token) ─────────────────────────────────
++from . import mobile_api as m  # noqa: E402
++
++urlpatterns += [
++    path('api/m/auth/login/', m.m_login, name='m_login'),
++    path('api/m/auth/logout/', m.m_logout, name='m_logout'),
++    path('api/m/me/', m.m_me, name='m_me'),
++    path('api/m/tokens/', m.m_tokens, name='m_tokens'),
++    path('api/m/users/', m.m_users, name='m_users'),
++    path('api/m/users/<str:user_id>/', m.m_user_detail, name='m_user_detail'),
++    path('api/m/users/<str:user_id>/update/', m.m_user_update, name='m_user_update'),
++    path('api/m/users/<str:user_id>/delete/', m.m_user_delete, name='m_user_delete'),
++    path('api/m/users/<str:user_id>/revoke-sessions/', m.m_user_revoke_sessions, name='m_user_revoke_sessions'),
++    path('api/m/comments/', m.m_comments, name='m_comments'),
++    path('api/m/collections/', m.m_collections, name='m_collections'),
++    path('api/m/collections/<str:collection>/', m.m_collection, name='m_collection'),
++    path('api/m/collections/<str:collection>/delete/', m.m_collection_delete, name='m_collection_delete'),
++    path('api/m/reports/', m.m_reports, name='m_reports'),
++    path('api/m/reports/<str:report_id>/action/', m.m_report_action, name='m_report_action'),
++    path('api/m/broadcast/', m.m_broadcast, name='m_broadcast'),
++    path('api/m/settings/', m.m_settings, name='m_settings'),
++    path('api/m/servers/', m.m_servers, name='m_servers'),
++    path('api/m/admins/', m.m_admins, name='m_admins'),
++    path('api/m/audit-logs/', m.m_audit_logs, name='m_audit_logs'),
++    path('api/m/error-logs/', m.m_error_logs, name='m_error_logs'),
++]
